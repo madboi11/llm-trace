@@ -1,0 +1,20 @@
+# Build output
+build/
+third_party/llama.cpp/build/
+
+# Models — large binaries, never commit
+models/
+*.gguf
+
+# Compiled objects / binaries
+*.o
+*.a
+*.so
+*.out
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
