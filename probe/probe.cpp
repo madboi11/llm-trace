@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "ggml.h"
 
+#include <chrono>
 #include <clocale>
 #include <string>
 #include <vector>
@@ -28,21 +29,86 @@ static const char * type_name(LayerType t) {
     }
 }
 
+struct Capture {
+    std::string name;
+    LayerType   type;
+    std::string op;
+    std::string dtype;
+    int64_t     ne[4];
+    double      ms;
+};
+
+struct RingBuffer {
+    std::vector<Capture> buf;
+    size_t head = 0;
+    size_t count = 0;
+
+    RingBuffer(size_t capacity) : buf(capacity) {}
+
+    void push(const Capture & c) {
+        buf[head] = c;
+        head = (head + 1) % buf.size();
+        if (count < buf.size()) {
+            count++;
+        }
+    }
+
+    size_t size() const {
+        return count;
+    }
+
+    const Capture & at(size_t i) const {
+        size_t start = (count == buf.size()) ? head : 0;
+        return buf[(start + i) % buf.size()];
+    }
+};
+
+struct TraceState {
+    RingBuffer ring;
+    std::chrono::steady_clock::time_point last;
+    bool have_last = false;
+
+    TraceState(size_t capacity) : ring(capacity) {}
+};
+
 static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
         return true;
     }
 
-    LayerType type = classify(t->name);
-    LOG("%-20s | %-5s | %-10s | %-5s | [%lld, %lld, %lld, %lld]\n",
-        t->name,
-        type_name(type),
-        ggml_op_desc(t),
-        ggml_type_name(t->type),
-        (long long) t->ne[0],
-        (long long) t->ne[1],
-        (long long) t->ne[2],
-        (long long) t->ne[3]);
+    TraceState * state = (TraceState *) user_data;
+
+    auto now = std::chrono::steady_clock::now();
+    double ms = 0.0;
+    if (state->have_last) {
+        ms = std::chrono::duration<double, std::milli>(now - state->last).count();
+    }
+    state->last = now;
+    state->have_last = true;
+
+    Capture c;
+    c.name  = t->name;
+    c.type  = classify(t->name);
+    c.op    = ggml_op_desc(t);
+    c.dtype = ggml_type_name(t->type);
+    c.ne[0] = t->ne[0];
+    c.ne[1] = t->ne[1];
+    c.ne[2] = t->ne[2];
+    c.ne[3] = t->ne[3];
+    c.ms    = ms;
+
+    state->ring.push(c);
+
+    LOG("%-20s | %-5s | %-10s | %-5s | %7.3f ms | [%lld, %lld, %lld, %lld]\n",
+        c.name.c_str(),
+        type_name(c.type),
+        c.op.c_str(),
+        c.dtype.c_str(),
+        c.ms,
+        (long long) c.ne[0],
+        (long long) c.ne[1],
+        (long long) c.ne[2],
+        (long long) c.ne[3]);
 
     return true;
 }
@@ -80,8 +146,10 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    TraceState state(64);
+
     params.cb_eval = trace_cb;
-    params.cb_eval_user_data = nullptr;
+    params.cb_eval_user_data = &state;
     params.warmup = false;
 
     auto llama_init = common_init_from_params(params);
@@ -94,11 +162,19 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n");
-    LOG("%-20s | %-5s | %-10s | %-5s | shape\n", "name", "type", "op", "dtype");
-    LOG("-------------------------------------------------------------------------\n");
+    LOG("%-20s | %-5s | %-10s | %-5s | %-10s | shape\n", "name", "type", "op", "dtype", "latency");
+    LOG("-----------------------------------------------------------------------------------\n");
 
     if (!run(ctx, params)) {
         return 1;
+    }
+
+    LOG("\nring buffer kept the last %zu of all traced nodes (capacity %zu):\n",
+        state.ring.size(), state.ring.buf.size());
+    for (size_t i = 0; i < state.ring.size(); i++) {
+        const Capture & c = state.ring.at(i);
+        LOG("  %-20s | %-5s | %-10s | %7.3f ms\n",
+            c.name.c_str(), type_name(c.type), c.op.c_str(), c.ms);
     }
 
     llama_backend_free();
