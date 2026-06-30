@@ -4,14 +4,20 @@
 #include "common.h"
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/dom/elements.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -20,8 +26,6 @@
 
 using namespace ftxui;
 
-// group key for a node: drop the " (view)"/"(permuted)" decoration and the
-// trailing layer index, so ffn_gate-7 and ffn_gate-12 share the role "ffn_gate".
 static std::string role_of(const std::string & name) {
     std::string r = name;
     size_t paren = r.find(" (");
@@ -43,8 +47,6 @@ struct RoleGroup {
     std::vector<Capture> nodes;
 };
 
-// Accumulated tree of every node seen, grouped by role. Updated by the
-// inference thread, read by the UI thread, guarded by a mutex.
 struct Topology {
     mutable std::mutex mtx;
     std::vector<RoleGroup> roles;
@@ -53,7 +55,6 @@ struct Topology {
 
     void update(const Capture & c) {
         std::lock_guard<std::mutex> lock(mtx);
-
         std::string role = role_of(c.name);
         size_t ri;
         auto it = role_pos.find(role);
@@ -64,7 +65,6 @@ struct Topology {
         } else {
             ri = it->second;
         }
-
         auto nit = node_pos.find(c.name);
         if (nit == node_pos.end()) {
             roles[ri].nodes.push_back(c);
@@ -80,9 +80,25 @@ struct Topology {
     }
 };
 
+// attention weights of one prompt decode for the selected layer (all heads).
+// value(key j, query i, head h) = data[j + i*n_kv + h*n_kv*n_query]
+struct Attention {
+    mutable std::mutex mtx;
+    bool valid = false;
+    int layer = 0;
+    int n_query = 0;
+    int n_head = 0;
+    int n_kv = 0;
+    double ms = 0;
+    std::vector<float> data;
+    std::vector<std::string> labels;
+};
+
 struct Shared {
     TraceBuffer ring;
     Topology    topo;
+    Attention   attn;
+    std::atomic<int> sel_layer{0};
     Shared(size_t cap) : ring(cap) {}
 };
 
@@ -121,6 +137,26 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     ps->sh.ring.push(c);
     ps->sh.topo.update(c);
+
+    if (c.name.rfind("kq_soft_max-", 0) == 0 && t->ne[1] > 1) {
+        int layer = std::atoi(c.name.c_str() + 12);
+        if (layer == ps->sh.sel_layer.load()) {
+            std::vector<float> tmp(ggml_nelements(t));
+            if (ggml_backend_buffer_is_host(t->buffer)) {
+                std::memcpy(tmp.data(), t->data, ggml_nbytes(t));
+            } else {
+                ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+            }
+            std::lock_guard<std::mutex> lock(ps->sh.attn.mtx);
+            ps->sh.attn.data    = std::move(tmp);
+            ps->sh.attn.n_kv    = t->ne[0];
+            ps->sh.attn.n_query = t->ne[1];
+            ps->sh.attn.n_head  = t->ne[2];
+            ps->sh.attn.layer   = layer;
+            ps->sh.attn.ms      = ms;
+            ps->sh.attn.valid   = true;
+        }
+    }
     return true;
 }
 
@@ -174,11 +210,38 @@ static Color color_of(LayerType t) {
     }
 }
 
-// one visible line in the topology tree
+static std::string short_label(std::string s) {
+    for (char & ch : s) {
+        if ((unsigned char) ch < 32) {
+            ch = ' ';
+        }
+    }
+    if (s.size() > 7) {
+        s = s.substr(0, 7);
+    }
+    while (s.size() < 7) {
+        s += ' ';
+    }
+    return s;
+}
+
 struct Row {
     bool   is_role;
     size_t ri;
     size_t ni;
+};
+
+// snapshot of the attention struct for one render frame
+struct AttnView {
+    bool valid = false;
+    int layer = 0, n_query = 0, n_head = 0, n_kv = 0;
+    double ms = 0;
+    std::vector<float> data;
+    std::vector<std::string> labels;
+
+    float at(int i, int j, int h) const {
+        return data[j + i * n_kv + h * n_kv * n_query];
+    }
 };
 
 int main(int argc, char ** argv) {
@@ -187,6 +250,10 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+
+    if (params.prompt.empty()) {
+        params.prompt = "The cat sat on the mat";
     }
 
     llama_backend_init();
@@ -198,6 +265,7 @@ int main(int argc, char ** argv) {
     params.cb_eval = trace_cb;
     params.cb_eval_user_data = &ps;
     params.warmup = false;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;  // exposes kq_soft_max
 
     auto llama_init = common_init_from_params(params);
     auto * model = llama_init->model();
@@ -208,6 +276,17 @@ int main(int argc, char ** argv) {
     }
 
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+
+    const int n_layers = llama_model_n_layer(model);
+
+    {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        bool add_bos = llama_vocab_get_add_bos(vocab);
+        std::vector<llama_token> ptoks = common_tokenize(ctx, params.prompt, add_bos, true);
+        for (llama_token tk : ptoks) {
+            shared.attn.labels.push_back(common_token_to_piece(ctx, tk, true));
+        }
+    }
 
     std::atomic<bool> stop{false};
     std::thread producer(inference_loop, ctx, model, std::ref(ps), params.prompt, std::ref(stop));
@@ -222,13 +301,16 @@ int main(int argc, char ** argv) {
         }
     });
 
-    int focused = 0;                 // 0 = topology, 1 = metrics, 2 = stream
-    int cursor = 0;                  // index into the visible rows
-    std::vector<char> expanded;      // per role, indexed by role order
-    std::vector<RoleGroup> roles;    // last snapshot (UI thread only)
-    std::vector<Row> rows;           // last visible rows (UI thread only)
+    int focused = 0;                 // 0 topology, 1 attention, 2 metrics, 3 stream
+    int active_selector = 0;         // which panel drives the metrics: 0 topology, 1 attention
+    int cursor = 0;
+    int sel_head = 0;
+    std::vector<char> expanded;
+    std::vector<RoleGroup> roles;
+    std::vector<Row> rows;
+    AttnView av;
 
-    auto rebuild_rows = [&] {
+    auto rebuild = [&] {
         roles = shared.topo.snapshot();
         if (expanded.size() < roles.size()) {
             expanded.resize(roles.size(), 0);
@@ -247,6 +329,19 @@ int main(int argc, char ** argv) {
         }
         if (cursor < 0) {
             cursor = 0;
+        }
+
+        std::lock_guard<std::mutex> lock(shared.attn.mtx);
+        av.valid   = shared.attn.valid;
+        av.layer   = shared.attn.layer;
+        av.n_query = shared.attn.n_query;
+        av.n_head  = shared.attn.n_head;
+        av.n_kv    = shared.attn.n_kv;
+        av.ms      = shared.attn.ms;
+        av.data    = shared.attn.data;
+        av.labels  = shared.attn.labels;
+        if (av.n_head > 0 && sel_head >= av.n_head) {
+            sel_head = av.n_head - 1;
         }
     };
 
@@ -285,7 +380,7 @@ int main(int argc, char ** argv) {
         return vbox(std::move(lines)) | frame | flex;
     };
 
-    auto metrics_panel = [&] {
+    auto topology_metrics = [&]() -> Element {
         if (rows.empty()) {
             return vbox({text("(no selection)") | dim});
         }
@@ -317,6 +412,95 @@ int main(int argc, char ** argv) {
         });
     };
 
+    auto attention_metrics = [&]() -> Element {
+        if (!av.valid || av.n_query == 0 || av.n_head == 0) {
+            return vbox({text("waiting for attention...") | dim});
+        }
+        int h = sel_head < 0 ? 0 : (sel_head >= av.n_head ? av.n_head - 1 : sel_head);
+
+        double sum_entropy = 0, max_w = 0, self_sum = 0, sink_sum = 0;
+        for (int i = 0; i < av.n_query; i++) {
+            double ent = 0, rowmax = 0;
+            for (int j = 0; j < av.n_query; j++) {
+                float p = av.at(i, j, h);
+                if (p > 0) {
+                    ent -= p * std::log(p);
+                }
+                if (p > rowmax) {
+                    rowmax = p;
+                }
+            }
+            sum_entropy += ent;
+            if (rowmax > max_w) {
+                max_w = rowmax;
+            }
+            self_sum += av.at(i, i, h);
+            sink_sum += av.at(i, 0, h);
+        }
+        double n = av.n_query;
+        char buf[64];
+        auto fixed = [&](double x) {
+            std::snprintf(buf, sizeof(buf), "%.3f", x);
+            return std::string(buf);
+        };
+        return vbox({
+            text("layer:       " + std::to_string(av.layer)),
+            text("head:        " + std::to_string(h) + " / " + std::to_string(av.n_head - 1)),
+            text("score shape: [" + std::to_string(av.n_kv) + ", " +
+                 std::to_string(av.n_query) + ", " + std::to_string(av.n_head) + "]"),
+            text("node lat:    " + fixed(av.ms) + " ms"),
+            separator(),
+            text("avg entropy: " + fixed(sum_entropy / n) + " nats"),
+            text("peak weight: " + fixed(max_w)),
+            text("self-attn:   " + fixed(self_sum / n)),
+            text("sink (tok0): " + fixed(sink_sum / n)),
+        });
+    };
+
+    auto metrics_panel = [&]() -> Element {
+        if (active_selector == 1) {
+            return attention_metrics();
+        }
+        return topology_metrics();
+    };
+
+    auto attention_panel = [&] {
+        if (!av.valid || av.n_query == 0 || av.n_head == 0) {
+            return vbox({text("waiting for prompt-decode attention...") | dim});
+        }
+        int h = sel_head < 0 ? 0 : (sel_head >= av.n_head ? av.n_head - 1 : sel_head);
+
+        Elements out;
+        out.push_back(text("layer " + std::to_string(av.layer) + "/" + std::to_string(n_layers - 1) +
+                           "   head " + std::to_string(h) + "/" + std::to_string(av.n_head - 1) +
+                           "   seq " + std::to_string(av.n_query)));
+        out.push_back(text("←/→ head   ↑/↓ layer") | dim);
+
+        Elements col_hdr;
+        col_hdr.push_back(text("       "));
+        for (int j = 0; j < av.n_query; j++) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "%2d", j % 100);
+            col_hdr.push_back(text(b) | dim);
+        }
+        out.push_back(hbox(std::move(col_hdr)));
+
+        for (int i = 0; i < av.n_query; i++) {
+            Elements cells;
+            std::string lab = i < (int) av.labels.size() ? av.labels[i] : std::to_string(i);
+            cells.push_back(text(short_label(lab)) | dim);
+            for (int j = 0; j < av.n_query; j++) {
+                float w = av.at(i, j, h);
+                if (w < 0) w = 0;
+                if (w > 1) w = 1;
+                int v = (int) (30 + 225 * w);
+                cells.push_back(text("  ") | bgcolor(Color::RGB(v, v, v)));
+            }
+            out.push_back(hbox(std::move(cells)));
+        }
+        return vbox(std::move(out)) | frame | flex;
+    };
+
     auto stream_panel = [&] {
         size_t total = shared.ring.total_count();
         std::vector<Capture> recent = shared.ring.snapshot();
@@ -331,14 +515,17 @@ int main(int argc, char ** argv) {
     };
 
     auto renderer = Renderer([&] {
-        rebuild_rows();
+        rebuild();
         return vbox({
-            panel("Model Topology", topology_panel(), 0) | flex,
             hbox({
-                panel("Runtime Metrics", metrics_panel(), 1) | flex,
-                panel("Live Stream", stream_panel(), 2) | flex,
+                panel("Model Topology", topology_panel(), 0) | flex,
+                panel("Attention", attention_panel(), 1) | flex,
             }) | flex,
-            text(" Tab: panel   j/k: move   space: expand   q: quit ") | inverted,
+            hbox({
+                panel("Runtime Metrics", metrics_panel(), 2) | flex,
+                panel("Live Stream", stream_panel(), 3) | flex,
+            }) | flex,
+            text(" Tab: panel   j/k: move   space: expand   ←→ head  ↑↓ layer   q: quit ") | inverted,
         });
     });
 
@@ -348,20 +535,19 @@ int main(int argc, char ** argv) {
             return true;
         }
         if (e == Event::Tab) {
-            focused = (focused + 1) % 3;
+            focused = (focused + 1) % 4;
+            if (focused == 0 || focused == 1) {
+                active_selector = focused;
+            }
             return true;
         }
         if (focused == 0) {
             if (e == Event::Character('j') || e == Event::ArrowDown) {
-                if (cursor + 1 < (int) rows.size()) {
-                    cursor++;
-                }
+                if (cursor + 1 < (int) rows.size()) cursor++;
                 return true;
             }
             if (e == Event::Character('k') || e == Event::ArrowUp) {
-                if (cursor > 0) {
-                    cursor--;
-                }
+                if (cursor > 0) cursor--;
                 return true;
             }
             if (e == Event::Character(' ') || e == Event::Return) {
@@ -369,6 +555,26 @@ int main(int argc, char ** argv) {
                     size_t ri = rows[cursor].ri;
                     expanded[ri] = !expanded[ri];
                 }
+                return true;
+            }
+        }
+        if (focused == 1) {
+            if (e == Event::ArrowLeft) {
+                if (sel_head > 0) sel_head--;
+                return true;
+            }
+            if (e == Event::ArrowRight) {
+                if (av.n_head > 0 && sel_head + 1 < av.n_head) sel_head++;
+                return true;
+            }
+            if (e == Event::ArrowUp) {
+                int l = shared.sel_layer.load();
+                if (l > 0) shared.sel_layer.store(l - 1);
+                return true;
+            }
+            if (e == Event::ArrowDown) {
+                int l = shared.sel_layer.load();
+                if (l + 1 < n_layers) shared.sel_layer.store(l + 1);
                 return true;
             }
         }
