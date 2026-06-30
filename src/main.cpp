@@ -105,7 +105,9 @@ struct Shared {
 struct ProducerState {
     Shared & sh;
     std::chrono::steady_clock::time_point last;
+    std::chrono::steady_clock::time_point start;
     bool have_last = false;
+    size_t seq = 0;
     ProducerState(Shared & s) : sh(s) {}
 };
 
@@ -117,6 +119,9 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ProducerState * ps = (ProducerState *) user_data;
 
     auto now = std::chrono::steady_clock::now();
+    if (!ps->have_last) {
+        ps->start = now;
+    }
     double ms = 0.0;
     if (ps->have_last) {
         ms = std::chrono::duration<double, std::milli>(now - ps->last).count();
@@ -125,15 +130,18 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ps->have_last = true;
 
     Capture c;
-    c.name  = t->name;
-    c.type  = classify(t->name);
-    c.op    = ggml_op_desc(t);
-    c.dtype = ggml_type_name(t->type);
-    c.ne[0] = t->ne[0];
-    c.ne[1] = t->ne[1];
-    c.ne[2] = t->ne[2];
-    c.ne[3] = t->ne[3];
-    c.ms    = ms;
+    c.id     = ps->seq++;
+    c.t_ms   = std::chrono::duration<double, std::milli>(now - ps->start).count();
+    c.name   = t->name;
+    c.type   = classify(t->name);
+    c.op     = ggml_op_desc(t);
+    c.dtype  = ggml_type_name(t->type);
+    c.device = t->buffer ? ggml_backend_buffer_name(t->buffer) : "?";
+    c.ne[0]  = t->ne[0];
+    c.ne[1]  = t->ne[1];
+    c.ne[2]  = t->ne[2];
+    c.ne[3]  = t->ne[3];
+    c.ms     = ms;
 
     ps->sh.ring.push(c);
     ps->sh.topo.update(c);
@@ -506,17 +514,32 @@ int main(int argc, char ** argv) {
         std::vector<Capture> recent = shared.ring.snapshot();
         Elements lines;
         lines.push_back(text("captured nodes: " + std::to_string(total)));
+        lines.push_back(text("   id     t(ms)  type   dev   node") | dim);
         lines.push_back(separator());
-        size_t show = recent.size() < 8 ? recent.size() : 8;
+        size_t show = recent.size() < 14 ? recent.size() : 14;
         for (size_t i = recent.size() - show; i < recent.size(); i++) {
-            lines.push_back(text(recent[i].name) | dim);
+            const Capture & c = recent[i];
+            char buf[192];
+            std::snprintf(buf, sizeof(buf), "%6zu %8.2f  %-5s %-4s %s",
+                          c.id, c.t_ms, type_name(c.type), c.device.c_str(), c.name.c_str());
+            lines.push_back(text(buf) | color(color_of(c.type)));
         }
-        return vbox(std::move(lines));
+        return vbox(std::move(lines)) | frame | flex;
     };
 
     auto renderer = Renderer([&] {
         rebuild();
         return vbox({
+            hbox({
+                text(" llm-trace ") | bold | bgcolor(Color::Blue) | color(Color::White),
+                text(" live ggml forward-pass tracer ") | dim,
+                filler(),
+                text("Attn ")  | color(Color::Red),
+                text("MLP ")   | color(Color::Cyan),
+                text("Norm ")  | color(Color::Yellow),
+                text("Embed ") | color(Color::Magenta),
+                text("Other ") | color(Color::GrayLight),
+            }),
             hbox({
                 panel("Model Topology", topology_panel(), 0) | flex,
                 panel("Attention", attention_panel(), 1) | flex,

@@ -27,12 +27,15 @@ inline const char * type_name(LayerType t) {
 }
 
 struct Capture {
+    size_t      id;
+    double      t_ms;     // time since trace start
     std::string name;
     LayerType   type;
     std::string op;
     std::string dtype;
+    std::string device;
     int64_t     ne[4];
-    double      ms;
+    double      ms;       // latency since previous node
 };
 
 // Shared between the inference thread (push) and the UI thread (snapshot).
