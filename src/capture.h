@@ -36,6 +36,10 @@ struct Capture {
     std::string device;
     int64_t     ne[4];
     double      ms;       // latency since previous node
+
+    bool        stats_ok = false;
+    double      mean = 0, vmin = 0, vmax = 0, vstd = 0, sparsity = 0;
+    int         n_bad = 0;   // count of NaN/Inf values
 };
 
 // Shared between the inference thread (push) and the UI thread (snapshot).

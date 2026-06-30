@@ -53,7 +53,7 @@ struct Topology {
     std::unordered_map<std::string, size_t> role_pos;
     std::unordered_map<std::string, std::pair<size_t, size_t>> node_pos;
 
-    void update(const Capture & c) {
+    void update(Capture c) {
         std::lock_guard<std::mutex> lock(mtx);
         std::string role = role_of(c.name);
         size_t ri;
@@ -70,7 +70,18 @@ struct Topology {
             roles[ri].nodes.push_back(c);
             node_pos[c.name] = {ri, roles[ri].nodes.size() - 1};
         } else {
-            roles[nit->second.first].nodes[nit->second.second] = c;
+            Capture & dst = roles[nit->second.first].nodes[nit->second.second];
+            // keep the last good stats when this fire didn't compute them
+            if (!c.stats_ok && dst.stats_ok) {
+                c.stats_ok = true;
+                c.mean = dst.mean;
+                c.vmin = dst.vmin;
+                c.vmax = dst.vmax;
+                c.vstd = dst.vstd;
+                c.sparsity = dst.sparsity;
+                c.n_bad = dst.n_bad;
+            }
+            dst = c;
         }
     }
 
@@ -82,15 +93,18 @@ struct Topology {
 
 // attention weights of one prompt decode for the selected layer (all heads).
 // value(key j, query i, head h) = data[j + i*n_kv + h*n_kv*n_query]
-struct Attention {
-    mutable std::mutex mtx;
+struct LayerAttn {
     bool valid = false;
-    int layer = 0;
     int n_query = 0;
     int n_head = 0;
     int n_kv = 0;
     double ms = 0;
     std::vector<float> data;
+};
+
+struct Attention {
+    mutable std::mutex mtx;
+    std::vector<LayerAttn> layers;       // one per model layer
     std::vector<std::string> labels;
 };
 
@@ -98,7 +112,6 @@ struct Shared {
     TraceBuffer ring;
     Topology    topo;
     Attention   attn;
-    std::atomic<int> sel_layer{0};
     Shared(size_t cap) : ring(cap) {}
 };
 
@@ -110,6 +123,8 @@ struct ProducerState {
     size_t seq = 0;
     ProducerState(Shared & s) : sh(s) {}
 };
+
+static void fill_stats(Capture & c, const ggml_tensor * t);
 
 static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
@@ -142,27 +157,32 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     c.ne[2]  = t->ne[2];
     c.ne[3]  = t->ne[3];
     c.ms     = ms;
+    if (t->ne[1] > 1) {            // prompt decode only — keeps generation fast
+        fill_stats(c, t);
+    }
 
     ps->sh.ring.push(c);
     ps->sh.topo.update(c);
 
+    // capture the score matrix for every layer on the prompt decode,
+    // so the UI can switch layers instantly
     if (c.name.rfind("kq_soft_max-", 0) == 0 && t->ne[1] > 1) {
         int layer = std::atoi(c.name.c_str() + 12);
-        if (layer == ps->sh.sel_layer.load()) {
-            std::vector<float> tmp(ggml_nelements(t));
-            if (ggml_backend_buffer_is_host(t->buffer)) {
-                std::memcpy(tmp.data(), t->data, ggml_nbytes(t));
-            } else {
-                ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
-            }
-            std::lock_guard<std::mutex> lock(ps->sh.attn.mtx);
-            ps->sh.attn.data    = std::move(tmp);
-            ps->sh.attn.n_kv    = t->ne[0];
-            ps->sh.attn.n_query = t->ne[1];
-            ps->sh.attn.n_head  = t->ne[2];
-            ps->sh.attn.layer   = layer;
-            ps->sh.attn.ms      = ms;
-            ps->sh.attn.valid   = true;
+        std::vector<float> tmp(ggml_nelements(t));
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            std::memcpy(tmp.data(), t->data, ggml_nbytes(t));
+        } else {
+            ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+        }
+        std::lock_guard<std::mutex> lock(ps->sh.attn.mtx);
+        if (layer >= 0 && layer < (int) ps->sh.attn.layers.size()) {
+            LayerAttn & la = ps->sh.attn.layers[layer];
+            la.data    = std::move(tmp);
+            la.n_kv    = t->ne[0];
+            la.n_query = t->ne[1];
+            la.n_head  = t->ne[2];
+            la.ms      = ms;
+            la.valid   = true;
         }
     }
     return true;
@@ -196,7 +216,7 @@ static void inference_loop(llama_context * ctx, const llama_model * model,
             break;
         }
 
-        for (int i = 0; i < 128 && !stop.load(); i++) {
+        for (int i = 0; i < 32 && !stop.load(); i++) {
             llama_token tok = greedy(ctx, vocab);
             if (llama_vocab_is_eog(vocab, tok)) {
                 break;
@@ -231,6 +251,61 @@ static std::string short_label(std::string s) {
         s += ' ';
     }
     return s;
+}
+
+// numeric stats over a node's output (contiguous f32/f16 only)
+static void fill_stats(Capture & c, const ggml_tensor * t) {
+    c.stats_ok = false;
+    if (!ggml_is_contiguous(t)) {
+        return;
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+        return;
+    }
+    int64_t n = ggml_nelements(t);
+    if (n <= 0) {
+        return;
+    }
+
+    const void * raw;
+    std::vector<char> tmp;
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        raw = t->data;
+    } else {
+        tmp.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+        raw = tmp.data();
+    }
+
+    double sum = 0, sumsq = 0, mn = 0, mx = 0;
+    int64_t zeros = 0, good = 0;
+    int bad = 0;
+    bool first = true;
+    for (int64_t i = 0; i < n; i++) {
+        float v = (t->type == GGML_TYPE_F32)
+                      ? ((const float *) raw)[i]
+                      : ggml_fp16_to_fp32(((const ggml_fp16_t *) raw)[i]);
+        if (!std::isfinite(v)) {
+            bad++;
+            continue;
+        }
+        sum += v;
+        sumsq += (double) v * v;
+        if (first || v < mn) mn = v;
+        if (first || v > mx) mx = v;
+        first = false;
+        if (std::fabs(v) < 1e-6f) zeros++;
+        good++;
+    }
+
+    c.stats_ok  = true;
+    c.mean      = good ? sum / good : 0;
+    double var  = good ? sumsq / good - c.mean * c.mean : 0;
+    c.vstd      = var > 0 ? std::sqrt(var) : 0;
+    c.vmin      = mn;
+    c.vmax      = mx;
+    c.sparsity  = (double) zeros / n;
+    c.n_bad     = bad;
 }
 
 struct Row {
@@ -286,6 +361,7 @@ int main(int argc, char ** argv) {
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
 
     const int n_layers = llama_model_n_layer(model);
+    shared.attn.layers.resize(n_layers);
 
     {
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -309,13 +385,17 @@ int main(int argc, char ** argv) {
         }
     });
 
-    int focused = 0;                 // 0 topology, 1 attention, 2 metrics, 3 stream
+    int focused = 0;                 // 0 topology, 1 attention, 2 metrics, 3 stream, 4 ledger
     int active_selector = 0;         // which panel drives the metrics: 0 topology, 1 attention
     int cursor = 0;
     int sel_head = 0;
+    int sel_layer = 0;
+    int led_cursor = 0;
+    bool attn_full = false;
     std::vector<char> expanded;
     std::vector<RoleGroup> roles;
     std::vector<Row> rows;
+    std::vector<Capture> flat;       // every node, flattened, for the anomaly ledger
     AttnView av;
 
     auto rebuild = [&] {
@@ -339,15 +419,33 @@ int main(int argc, char ** argv) {
             cursor = 0;
         }
 
+        flat.clear();
+        for (const auto & g : roles) {
+            for (const auto & c : g.nodes) {
+                flat.push_back(c);
+            }
+        }
+        if (led_cursor >= (int) flat.size()) {
+            led_cursor = flat.empty() ? 0 : (int) flat.size() - 1;
+        }
+        if (led_cursor < 0) {
+            led_cursor = 0;
+        }
+
         std::lock_guard<std::mutex> lock(shared.attn.mtx);
-        av.valid   = shared.attn.valid;
-        av.layer   = shared.attn.layer;
-        av.n_query = shared.attn.n_query;
-        av.n_head  = shared.attn.n_head;
-        av.n_kv    = shared.attn.n_kv;
-        av.ms      = shared.attn.ms;
-        av.data    = shared.attn.data;
-        av.labels  = shared.attn.labels;
+        av.labels = shared.attn.labels;
+        av.layer  = sel_layer;
+        if (sel_layer >= 0 && sel_layer < (int) shared.attn.layers.size()) {
+            const LayerAttn & la = shared.attn.layers[sel_layer];
+            av.valid   = la.valid;
+            av.n_query = la.n_query;
+            av.n_head  = la.n_head;
+            av.n_kv    = la.n_kv;
+            av.ms      = la.ms;
+            av.data    = la.data;
+        } else {
+            av.valid = false;
+        }
         if (av.n_head > 0 && sel_head >= av.n_head) {
             sel_head = av.n_head - 1;
         }
@@ -520,26 +618,74 @@ int main(int argc, char ** argv) {
         for (size_t i = recent.size() - show; i < recent.size(); i++) {
             const Capture & c = recent[i];
             char buf[192];
-            std::snprintf(buf, sizeof(buf), "%6zu %8.2f  %-5s %-4s %s",
+            std::snprintf(buf, sizeof(buf), "%6zu %8.2f  %-5s %-4s %-22.22s",
                           c.id, c.t_ms, type_name(c.type), c.device.c_str(), c.name.c_str());
             lines.push_back(text(buf) | color(color_of(c.type)));
         }
         return vbox(std::move(lines)) | frame | flex;
     };
 
+    auto ledger_panel = [&] {
+        Elements lines;
+        lines.push_back(text("  node                      mean       min       max       std   spars  flag") | dim);
+        lines.push_back(separator());
+        for (size_t i = 0; i < flat.size(); i++) {
+            const Capture & c = flat[i];
+            std::string nm = c.name.size() > 24 ? c.name.substr(0, 24) : c.name;
+            char buf[224];
+            Color col = Color::Default;
+            if (!c.stats_ok) {
+                std::snprintf(buf, sizeof(buf), "  %-24s  (no stats)", nm.c_str());
+                col = Color::GrayDark;
+            } else {
+                const char * flag = "";
+                if (c.n_bad > 0) {
+                    flag = "NaN/Inf";
+                    col = Color::Red;
+                } else if (std::fabs(c.vmax) > 1000 || std::fabs(c.vmin) > 1000) {
+                    flag = "large";
+                    col = Color::Yellow;
+                }
+                std::snprintf(buf, sizeof(buf), "  %-24s %9.3f %9.3f %9.3f %9.3f %4.0f%%  %s",
+                              nm.c_str(), c.mean, c.vmin, c.vmax, c.vstd, c.sparsity * 100, flag);
+            }
+            Element e = text(buf) | color(col);
+            if ((int) i == led_cursor && focused == 4) {
+                e = e | inverted | focus;
+            }
+            lines.push_back(e);
+        }
+        if (flat.size() < 3) {
+            lines.push_back(text("collecting...") | dim);
+        }
+        return vbox(std::move(lines)) | frame | flex;
+    };
+
     auto renderer = Renderer([&] {
         rebuild();
+        Element title = hbox({
+            text(" llm-trace ") | bold | bgcolor(Color::Blue) | color(Color::White),
+            text(" live ggml forward-pass tracer ") | dim,
+            filler(),
+            text("Attn ")  | color(Color::Red),
+            text("MLP ")   | color(Color::Cyan),
+            text("Norm ")  | color(Color::Yellow),
+            text("Embed ") | color(Color::Magenta),
+            text("Other ") | color(Color::GrayLight),
+        });
+        Element status =
+            text(" Tab: panel   j/k: move   space: expand   ←→ head  ↑↓ layer   f: fullscreen attn   q: quit ") | inverted;
+
+        if (attn_full) {
+            return vbox({
+                title,
+                panel("Attention  (f / Esc to exit)", attention_panel(), 1) | flex,
+                status,
+            });
+        }
+
         return vbox({
-            hbox({
-                text(" llm-trace ") | bold | bgcolor(Color::Blue) | color(Color::White),
-                text(" live ggml forward-pass tracer ") | dim,
-                filler(),
-                text("Attn ")  | color(Color::Red),
-                text("MLP ")   | color(Color::Cyan),
-                text("Norm ")  | color(Color::Yellow),
-                text("Embed ") | color(Color::Magenta),
-                text("Other ") | color(Color::GrayLight),
-            }),
+            title,
             hbox({
                 panel("Model Topology", topology_panel(), 0) | flex,
                 panel("Attention", attention_panel(), 1) | flex,
@@ -547,20 +693,39 @@ int main(int argc, char ** argv) {
             hbox({
                 panel("Runtime Metrics", metrics_panel(), 2) | flex,
                 panel("Live Stream", stream_panel(), 3) | flex,
-            }) | flex,
-            text(" Tab: panel   j/k: move   space: expand   ←→ head  ↑↓ layer   q: quit ") | inverted,
+            }) | size(HEIGHT, EQUAL, 9),
+            panel("Numerical Anomaly Ledger", ledger_panel(), 4) | size(HEIGHT, EQUAL, 8),
+            status,
         });
     });
 
     auto component = CatchEvent(renderer, [&](Event e) {
-        if (e == Event::Character('q') || e == Event::Escape) {
+        if (e == Event::Character('q')) {
             screen.Exit();
             return true;
         }
+        if (e == Event::Escape) {
+            if (attn_full) {
+                attn_full = false;
+            } else {
+                screen.Exit();
+            }
+            return true;
+        }
+        if (e == Event::Character('f')) {
+            attn_full = !attn_full;
+            if (attn_full) {
+                focused = 1;
+                active_selector = 1;
+            }
+            return true;
+        }
         if (e == Event::Tab) {
-            focused = (focused + 1) % 4;
-            if (focused == 0 || focused == 1) {
-                active_selector = focused;
+            if (!attn_full) {
+                focused = (focused + 1) % 5;
+                if (focused == 0 || focused == 1) {
+                    active_selector = focused;
+                }
             }
             return true;
         }
@@ -591,13 +756,21 @@ int main(int argc, char ** argv) {
                 return true;
             }
             if (e == Event::ArrowUp) {
-                int l = shared.sel_layer.load();
-                if (l > 0) shared.sel_layer.store(l - 1);
+                if (sel_layer > 0) sel_layer--;
                 return true;
             }
             if (e == Event::ArrowDown) {
-                int l = shared.sel_layer.load();
-                if (l + 1 < n_layers) shared.sel_layer.store(l + 1);
+                if (sel_layer + 1 < n_layers) sel_layer++;
+                return true;
+            }
+        }
+        if (focused == 4) {
+            if (e == Event::Character('j') || e == Event::ArrowDown) {
+                if (led_cursor + 1 < (int) flat.size()) led_cursor++;
+                return true;
+            }
+            if (e == Event::Character('k') || e == Event::ArrowUp) {
+                if (led_cursor > 0) led_cursor--;
                 return true;
             }
         }
