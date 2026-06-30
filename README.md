@@ -7,9 +7,6 @@ interactive terminal UI.
 
 > *btop / lazygit, but for watching a transformer's forward pass.*
 
-<!-- TODO: record a short GIF (asciinema / terminalizer) or add a screenshot, then
-     embed it here. -->
-
 ## How it works (the core idea)
 
 This tool does **not** reimplement inference. It instruments an existing engine
@@ -110,16 +107,3 @@ truecolor terminal (e.g. Windows Terminal) is recommended for the heatmap.
 - **TUI:** FTXUI v7 (pinned submodule)
 - **Test model:** Qwen2.5-0.5B-Instruct (GGUF)
 - **Language:** C++17
-
-## What I learned
-
-<!-- TODO: rewrite this section in your own words before submission. -->
-
-- How `ggml`'s evaluation callback works, and the `ask` two-phase protocol for opting
-  in to a node before its data is ready.
-- Reading typed tensor data out of `ggml` buffers (pointers/casts, f16↔f32, host vs
-  non-host backends).
-- A single-producer / single-consumer design: a hand-rolled fixed-size ring buffer and
-  mutex-guarded shared state between an inference thread and a UI thread.
-- Building one CMake tree against two third-party libraries (llama.cpp + FTXUI).
-- Why flash-attention hides the attention score matrix, and how to expose it.
