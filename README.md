@@ -7,7 +7,8 @@ interactive terminal UI.
 
 > *btop / lazygit, but for watching a transformer's forward pass.*
 
-<!-- TODO: add a screenshot or GIF here (see "Demo" below) -->
+<!-- TODO: record a short GIF (asciinema / terminalizer) or add a screenshot, then
+     embed it here. -->
 
 ## How it works (the core idea)
 
@@ -20,10 +21,10 @@ compute graph runs, and is handed the live `ggml_tensor` — its name, op, type,
 shape (`ne[]`). That single hook is the whole capture layer.
 
 ```
-llama.cpp decode  ──fires per node──►  eval callback  ──►  ring buffer + topology
-   (producer thread)                   (capture layer)      (shared, mutex-guarded)
-                                                                     │
-                                                              FTXUI panels  ◄── UI thread
+llama.cpp decode  ──fires per node──►  eval callback  ──►  ring buffer + topology + per-layer attention
+   (producer thread)                   (capture layer)      (shared state, mutex-guarded)
+                                                                          │
+                                                                   FTXUI panels  ◄── UI thread
 ```
 
 Three details that make this work, each handled in `src/main.cpp`:
@@ -33,38 +34,42 @@ Three details that make this work, each handled in `src/main.cpp`:
    `true`), then with `ask == false` (data is ready — we do the real work).
 2. **Host copy for tensor data.** A tensor may live on a non-CPU backend, so reading
    its values requires `ggml_backend_tensor_get` after checking
-   `ggml_backend_buffer_is_host`. This is what makes the attention heatmap possible.
+   `ggml_backend_buffer_is_host`. This is what makes the attention heatmap and the
+   numeric stats possible.
 3. **Producer / consumer threading.** Inference runs on one thread (firing callbacks);
-   the TUI renders on another. The shared state — a fixed-size ring buffer and a
-   topology model — is guarded by a mutex.
+   the TUI renders on another. The shared state — a fixed-size ring buffer, the
+   topology model, and the per-layer attention store — is guarded by a mutex.
 
 ### Attention heatmap & flash-attention
 
 Flash-attention fuses the softmax and never materializes a `[seq × seq]` score
 tensor, so there is nothing to draw. The app forces flash-attention **off**
 (`flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED`), which switches `llama.cpp` to
-the explicit `softmax(QK·T)` path and exposes the `kq_soft_max-<layer>` tensor. That
-tensor is copied to host and rendered as a per-head heatmap — the causal mask shows up
-as a clean lower-triangular pattern.
+the explicit `softmax(QK·T)` path and exposes the `kq_soft_max-<layer>` tensor. On
+each prompt decode the score matrix is captured for **every** layer, so switching
+layers in the UI is instant. The causal mask shows up as a clean lower-triangular
+pattern.
 
 ## Panels
 
 | Panel | What it shows |
 |-------|---------------|
 | **Model Topology** | Every graph node, grouped by role (`ffn_gate`, `attn_norm`, …), expandable to its per-layer instances. Colored by layer type. |
-| **Attention** | `[seq × seq]` attention heatmap for a selected layer/head, with token labels. |
+| **Attention** | `[seq × seq]` attention heatmap for a selected layer/head, with token labels. Can go fullscreen. |
 | **Runtime Metrics** | Context-aware: the selected node's shape/dtype/op/latency, or attention stats (entropy, peak weight, self-attention, attention-sink). |
 | **Live Stream** | Scrolling feed of captured nodes — id, timestamp, type, compute device. |
+| **Numerical Anomaly Ledger** | Per-node mean / min / max / std / sparsity, flagging `NaN`/`Inf` and large-magnitude outliers. The forward pass's "vital signs". |
 
 ### Keybindings
 
 | Key | Action |
 |-----|--------|
 | `Tab` | cycle panel focus |
-| `j` / `k` | move selection (Topology) |
+| `j` / `k` | move selection (Topology, Ledger) |
 | `space` / `Enter` | expand / collapse a role (Topology) |
 | `←` / `→` | change attention head (Attention) |
 | `↑` / `↓` | change attention layer (Attention) |
+| `f` | toggle fullscreen Attention (`f` / `Esc` to exit) |
 | `q` / `Esc` | quit |
 
 ## Build (WSL2 / Ubuntu, CPU-only)
@@ -96,12 +101,8 @@ Download a small GGUF model, then run:
 ./build/llm-trace -m models/qwen2.5-0.5b-instruct-q4_k_m.gguf -p "The cat sat on the mat" -ngl 0
 ```
 
-A longer prompt gives a larger attention matrix. `-ngl 0` keeps it CPU-only.
-
-## Demo
-
-<!-- TODO: record a short GIF (e.g. `asciinema` / `terminalizer`) or add a screenshot,
-     then embed it at the top of this README. -->
+A longer prompt gives a larger attention matrix. `-ngl 0` keeps it CPU-only. A
+truecolor terminal (e.g. Windows Terminal) is recommended for the heatmap.
 
 ## Stack
 
@@ -112,7 +113,13 @@ A longer prompt gives a larger attention matrix. `-ngl 0` keeps it CPU-only.
 
 ## What I learned
 
-<!-- TODO (personalize this in your own words): the ggml eval-callback hook and the
-     ask two-phase protocol, reading typed data out of ggml buffers, the
-     single-producer/single-consumer ring buffer + threading, building one CMake tree
-     against two third-party libraries, and why flash-attention hides the score matrix. -->
+<!-- TODO: rewrite this section in your own words before submission. -->
+
+- How `ggml`'s evaluation callback works, and the `ask` two-phase protocol for opting
+  in to a node before its data is ready.
+- Reading typed tensor data out of `ggml` buffers (pointers/casts, f16↔f32, host vs
+  non-host backends).
+- A single-producer / single-consumer design: a hand-rolled fixed-size ring buffer and
+  mutex-guarded shared state between an inference thread and a UI thread.
+- Building one CMake tree against two third-party libraries (llama.cpp + FTXUI).
+- Why flash-attention hides the attention score matrix, and how to expose it.
